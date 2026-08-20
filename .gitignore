@@ -1,0 +1,12 @@
+﻿settings.json
+__pycache__/
+*.pyc
+crash_log.txt
+smoke_result.txt
+engine_fallback.txt
+worker_error.txt
+build/
+dist/
+dist_new/
+*.spec
+_github_tmp/
