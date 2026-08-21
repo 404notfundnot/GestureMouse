@@ -57,7 +57,7 @@ import cv2
 import numpy as np
 
 APP_NAME = "手势鼠标 GestureMouse"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 if getattr(sys, "frozen", False):
     # PyInstaller 打包运行：资源（模型/设置）与 exe 同目录
@@ -1994,11 +1994,52 @@ def build_gui(dry_run=False):
             style.configure("TLabel", background="#1e1e2e", foreground="#e0e0e0")
             style.configure("Title.TLabel", font=("Microsoft YaHei UI", 13, "bold"),
                             foreground="#ffffff")
-            style.configure("Accent.TButton", font=("Microsoft YaHei UI", 11, "bold"))
-            style.map("Accent.TButton",
-                      background=[("active", "#2f7a4f")])
+            style.configure("TNotebook", background="#1e1e2e", borderwidth=0)
+            style.configure("TNotebook.Tab", background="#252538",
+                            foreground="#c0c0d0", padding=(12, 5),
+                            font=("Microsoft YaHei UI", 10))
+            style.map("TNotebook.Tab",
+                      background=[("selected", "#33334a")],
+                      foreground=[("selected", "#ffffff")])
+            # 功能按钮配色
+            style.configure("Start.TButton", background="#2e7d46",
+                            foreground="#ffffff",
+                            font=("Microsoft YaHei UI", 11, "bold"))
+            style.map("Start.TButton", background=[("active", "#3c9a59")])
+            style.configure("Stop.TButton", background="#a33c3c",
+                            foreground="#ffffff",
+                            font=("Microsoft YaHei UI", 11, "bold"))
+            style.map("Stop.TButton", background=[("active", "#c14e4e")])
+            style.configure("Blue.TButton", background="#2a5d8a",
+                            foreground="#ffffff")
+            style.map("Blue.TButton", background=[("active", "#3574ab")])
+            style.configure("Amber.TButton", background="#6d5a26",
+                            foreground="#ffffff")
+            style.map("Amber.TButton", background=[("active", "#8a732f")])
+            style.configure("Val.TLabel", background="#1e1e2e",
+                            foreground="#9fd0ff", font=("Consolas", 10))
+
+        def _add_scale(self, parent, row, text, var, frm, to, fmt="%.2f"):
+            """带实时数值显示的滑条行。"""
+            ttk.Label(parent, text=text).grid(row=row, column=0, sticky="w",
+                                              padx=6, pady=3)
+            ttk.Scale(parent, from_=frm, to=to, variable=var,
+                      command=lambda v: self._param_changed()).grid(
+                row=row, column=1, sticky="we", padx=6, pady=3)
+            val = ttk.Label(parent, text=fmt % var.get(), style="Val.TLabel",
+                            width=6, anchor="e")
+            val.grid(row=row, column=2, sticky="e", padx=(0, 6))
+            self._scale_labels.append((var, val, fmt))
+
+        def _refresh_scale_labels(self):
+            for var, label, fmt in self._scale_labels:
+                try:
+                    label.config(text=fmt % var.get())
+                except Exception:
+                    pass
 
         def _build_widgets(self):
+            self._scale_labels = []
             left = ttk.Frame(self)
             left.pack(side="left", fill="both", expand=True, padx=(10, 6), pady=10)
 
@@ -2006,33 +2047,43 @@ def build_gui(dry_run=False):
                                         fg="#808080", font=("Microsoft YaHei UI", 12))
             self.video_label.pack(fill="both", expand=True)
 
-            self.status_bar = tk.Label(left, text="状态：未启动    |    引擎：-    |    FPS：-    |    手势：-",
+            self.status_bar = tk.Label(left, text="● 未启动    |    引擎：-    |    FPS：-    |    手势：-",
                                        anchor="w", bg="#252538", fg="#9fd0ff",
                                        font=("Microsoft YaHei UI", 10))
             self.status_bar.pack(fill="x", pady=(6, 0))
 
-            right = ttk.Frame(self, width=330)
+            right = ttk.Frame(self, width=350)
             right.pack(side="right", fill="y", padx=(6, 10), pady=10)
             right.pack_propagate(False)
 
-            ttk.Label(right, text="手势鼠标控制台", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(right, text="手势鼠标控制台 v%s" % VERSION,
+                      style="Title.TLabel").pack(anchor="w")
 
-            # 启动
+            # 主按钮区
             self.btn_start = ttk.Button(right, text="▶  开 始 识 别",
-                                        style="Accent.TButton",
+                                        style="Start.TButton",
                                         command=self._toggle_start)
             self.btn_start.pack(fill="x", pady=(8, 4))
 
-            self.btn_calib = ttk.Button(right, text="🧭  头 动 标 定",
+            self.btn_calib = ttk.Button(right, text="🧭  头 动 标 定", style="Blue.TButton",
                                         command=self._start_calibration)
             self.btn_calib.pack(fill="x", pady=(0, 4))
 
             self.btn_recenter = ttk.Button(right, text="⌖  重置中心（当前姿态设为正中）",
+                                           style="Amber.TButton",
                                            command=self._recenter_head)
-            self.btn_recenter.pack(fill="x", pady=(0, 4))
+            self.btn_recenter.pack(fill="x", pady=(0, 6))
 
-            # 设备
-            box = ttk.Labelframe(right, text=" 设备 ")
+            # 标签页：控制 / 参数 / 手势
+            nb = ttk.Notebook(right)
+            nb.pack(fill="both", expand=True)
+            self._nb = nb
+
+            # ---- 标签页 1：控制 ----
+            tab1 = ttk.Frame(nb)
+            nb.add(tab1, text="  控制  ")
+
+            box = ttk.Labelframe(tab1, text=" 设备 ")
             box.pack(fill="x", pady=4)
             ttk.Label(box, text="摄像头").grid(row=0, column=0, sticky="w", padx=6, pady=3)
             self.cam_var = tk.StringVar(value=str(self.settings.get("camera", "auto")))
@@ -2053,106 +2104,91 @@ def build_gui(dry_run=False):
                                   padx=6, pady=(2, 6))
             self._update_engine_note()
 
-            # 参数
-            box2 = ttk.Labelframe(right, text=" 参数 ")
-            box2.pack(fill="x", pady=4)
-
-            # 控制模式
+            box1 = ttk.Labelframe(tab1, text=" 控制方式 ")
+            box1.pack(fill="x", pady=4)
             self.hands_var = tk.StringVar(value=str(self.settings.get("hands_mode", "dual")))
-            ttk.Label(box2, text="控制模式（手势）", foreground="#9fd0ff").grid(
-                row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
-            self.rb_dual = ttk.Radiobutton(box2, text="双手模式（右手移动 · 左手动作）",
+            self.rb_dual = ttk.Radiobutton(box1, text="双手模式（右手移动 · 左手捏合动作）",
                                            variable=self.hands_var, value="dual",
                                            command=self._param_changed)
-            self.rb_dual.grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=1)
-            self.rb_single = ttk.Radiobutton(box2, text="单手模式（一只手全包）",
+            self.rb_dual.pack(anchor="w", padx=6, pady=(4, 1))
+            self.rb_single = ttk.Radiobutton(box1, text="单手模式（一只手全包）",
                                              variable=self.hands_var, value="single",
                                              command=self._param_changed)
-            self.rb_single.grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=1)
+            self.rb_single.pack(anchor="w", padx=6, pady=1)
 
-            # 头动光标：独立于手势系统的开关
             self.head_var = tk.BooleanVar(
                 value=bool(self.settings.get("head_enabled", False)))
-            ttk.Checkbutton(box2, text="头动光标（头指向哪光标去哪）",
+            ttk.Checkbutton(box1, text="🧭 头动光标（头指向哪光标去哪）",
                             variable=self.head_var,
-                            command=self._param_changed).grid(
-                row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
-            ttk.Label(box2, text="开启后与手势完全独立，可自由组合",
-                      foreground="#8888aa").grid(
-                row=4, column=0, columnspan=2, sticky="w", padx=6)
+                            command=self._param_changed).pack(
+                anchor="w", padx=6, pady=(4, 0))
+            ttk.Label(box1, text="  与手势完全独立，可自由组合",
+                      foreground="#8888aa").pack(anchor="w", padx=6)
 
-            ttk.Label(box2, text="灵敏度").grid(row=5, column=0, sticky="w", padx=6, pady=(4, 0))
-            self.sens_var = tk.DoubleVar(value=float(self.settings.get("sensitivity", 1.0)))
-            ttk.Scale(box2, from_=0.5, to=3.0, variable=self.sens_var,
-                      command=lambda v: self._param_changed()).grid(
-                row=5, column=1, sticky="we", padx=6)
-            ttk.Label(box2, text="触摸灵敏度").grid(row=6, column=0, sticky="w", padx=6, pady=3)
-            self.touch_var = tk.DoubleVar(
-                value=float(self.settings.get("touch_sensitivity", 0.55)))
-            ttk.Scale(box2, from_=0.3, to=0.9, variable=self.touch_var,
-                      command=lambda v: self._param_changed()).grid(
-                row=6, column=1, sticky="we", padx=6, pady=3)
-            ttk.Label(box2, text="越小越需贴紧 · 越大越易触发",
-                      foreground="#8888aa").grid(
-                row=7, column=0, columnspan=2, sticky="w", padx=6)
-            ttk.Label(box2, text="平滑度").grid(row=8, column=0, sticky="w", padx=6, pady=3)
-            self.smooth_var = tk.DoubleVar(value=float(self.settings.get("smoothing", 0.35)))
-            ttk.Scale(box2, from_=0.05, to=0.9, variable=self.smooth_var,
-                      command=lambda v: self._param_changed()).grid(
-                row=8, column=1, sticky="we", padx=6, pady=3)
-            ttk.Label(box2, text="滚轮速度").grid(row=9, column=0, sticky="w", padx=6, pady=3)
-            self.scroll_var = tk.DoubleVar(value=float(self.settings.get("scroll_speed", 1.0)))
-            ttk.Scale(box2, from_=0.3, to=3.0, variable=self.scroll_var,
-                      command=lambda v: self._param_changed()).grid(
-                row=9, column=1, sticky="we", padx=6, pady=3)
-            ttk.Label(box2, text="头动灵敏度").grid(row=10, column=0, sticky="w", padx=6, pady=3)
-            self.head_gain_var = tk.DoubleVar(
-                value=float(self.settings.get("head_sensitivity", 1.0)))
-            ttk.Scale(box2, from_=0.5, to=2.5, variable=self.head_gain_var,
-                      command=lambda v: self._param_changed()).grid(
-                row=10, column=1, sticky="we", padx=6, pady=3)
-            ttk.Label(box2, text="头部转动放大倍率（未标定时生效）",
-                      foreground="#8888aa").grid(
-                row=11, column=0, columnspan=2, sticky="w", padx=6)
-
-            self.mode_var = tk.StringVar(value=self.settings.get("mode", "absolute"))
-            ttk.Radiobutton(box2, text="绝对定位（手到哪光标到哪）",
-                            variable=self.mode_var, value="absolute",
-                            command=self._param_changed).grid(
-                row=12, column=0, columnspan=2, sticky="w", padx=6, pady=2)
-            ttk.Radiobutton(box2, text="相对移动（触摸板式）",
-                            variable=self.mode_var, value="relative",
-                            command=self._param_changed).grid(
-                row=13, column=0, columnspan=2, sticky="w", padx=6, pady=2)
-
-            self.mirror_var = tk.BooleanVar(value=bool(self.settings.get("mirror", True)))
-            ttk.Checkbutton(box2, text="镜像画面（推荐开启）", variable=self.mirror_var,
-                            command=self._param_changed).grid(
-                row=14, column=0, columnspan=2, sticky="w", padx=6, pady=2)
-            self.lm_var = tk.BooleanVar(value=bool(self.settings.get("show_landmarks", True)))
-            ttk.Checkbutton(box2, text="显示手部标记", variable=self.lm_var,
-                            command=self._param_changed).grid(
-                row=15, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
-            self.monitor_var = tk.BooleanVar(
-                value=bool(self.settings.get("monitor_enabled", True)))
-            ttk.Checkbutton(box2, text="右下角监视窗（悬浮置顶·可缩放）",
-                            variable=self.monitor_var,
-                            command=self._toggle_monitor).grid(
-                row=16, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
             self.game_var = tk.BooleanVar(
                 value=bool(self.settings.get("game_mode", False)))
-            ttk.Checkbutton(box2, text="🎮 游戏模式（战争雷霆等）",
+            ttk.Checkbutton(box1, text="🎮 游戏模式（战争雷霆等）",
                             variable=self.game_var,
-                            command=self._param_changed).grid(
-                row=17, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
-            ttk.Label(box2, text="SendInput 注入+4指=Tab锁定目标",
-                      foreground="#8888aa").grid(
-                row=18, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
-            box2.columnconfigure(1, weight=1)
+                            command=self._param_changed).pack(
+                anchor="w", padx=6, pady=(4, 0))
+            ttk.Label(box1, text="  SendInput 注入 · 4指=Tab锁定 · 捏合长按=开火",
+                      foreground="#8888aa").pack(anchor="w", padx=6, pady=(0, 6))
 
-            # 帮助
-            box3 = ttk.Labelframe(right, text=" 手势对照表 ")
-            box3.pack(fill="both", expand=True, pady=4)
+            self.monitor_var = tk.BooleanVar(
+                value=bool(self.settings.get("monitor_enabled", True)))
+            ttk.Checkbutton(tab1, text="右下角监视窗（悬浮置顶·可缩放）",
+                            variable=self.monitor_var,
+                            command=self._toggle_monitor).pack(
+                anchor="w", padx=6, pady=(2, 6))
+
+            # ---- 标签页 2：参数 ----
+            tab2 = ttk.Frame(nb)
+            nb.add(tab2, text="  参数  ")
+            tab2.columnconfigure(1, weight=1)
+
+            self.sens_var = tk.DoubleVar(value=float(self.settings.get("sensitivity", 1.0)))
+            self._add_scale(tab2, 0, "灵敏度", self.sens_var, 0.5, 3.0)
+            self.touch_var = tk.DoubleVar(
+                value=float(self.settings.get("touch_sensitivity", 0.55)))
+            self._add_scale(tab2, 1, "触摸灵敏度", self.touch_var, 0.3, 0.9)
+            ttk.Label(tab2, text="越小越需贴紧 · 越大越易触发",
+                      foreground="#8888aa").grid(row=2, column=0, columnspan=3,
+                                                 sticky="w", padx=6)
+            self.smooth_var = tk.DoubleVar(value=float(self.settings.get("smoothing", 0.35)))
+            self._add_scale(tab2, 3, "平滑度", self.smooth_var, 0.05, 0.9)
+            self.scroll_var = tk.DoubleVar(value=float(self.settings.get("scroll_speed", 1.0)))
+            self._add_scale(tab2, 4, "滚轮速度", self.scroll_var, 0.3, 3.0)
+            self.head_gain_var = tk.DoubleVar(
+                value=float(self.settings.get("head_sensitivity", 1.0)))
+            self._add_scale(tab2, 5, "头动灵敏度", self.head_gain_var, 0.5, 2.5)
+            ttk.Label(tab2, text="头部转动放大倍率（未标定时生效）",
+                      foreground="#8888aa").grid(row=6, column=0, columnspan=3,
+                                                 sticky="w", padx=6)
+
+            self.mode_var = tk.StringVar(value=self.settings.get("mode", "absolute"))
+            ttk.Label(tab2, text="移动模式", foreground="#9fd0ff").grid(
+                row=7, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 0))
+            ttk.Radiobutton(tab2, text="绝对定位（手到哪光标到哪）",
+                            variable=self.mode_var, value="absolute",
+                            command=self._param_changed).grid(
+                row=8, column=0, columnspan=3, sticky="w", padx=6, pady=1)
+            ttk.Radiobutton(tab2, text="相对移动（触摸板式 / 游戏视角）",
+                            variable=self.mode_var, value="relative",
+                            command=self._param_changed).grid(
+                row=9, column=0, columnspan=3, sticky="w", padx=6, pady=1)
+
+            self.mirror_var = tk.BooleanVar(value=bool(self.settings.get("mirror", True)))
+            ttk.Checkbutton(tab2, text="镜像画面（推荐开启）", variable=self.mirror_var,
+                            command=self._param_changed).grid(
+                row=10, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 2))
+            self.lm_var = tk.BooleanVar(value=bool(self.settings.get("show_landmarks", True)))
+            ttk.Checkbutton(tab2, text="显示手部/脸部标记", variable=self.lm_var,
+                            command=self._param_changed).grid(
+                row=11, column=0, columnspan=3, sticky="w", padx=6, pady=2)
+
+            # ---- 标签页 3：手势 ----
+            tab3 = ttk.Frame(nb)
+            nb.add(tab3, text="  手势  ")
             self.help_dual = (
                 "双手模式：\n"
                 "右手（食指尖）       移动光标\n"
@@ -2184,10 +2220,11 @@ def build_gui(dry_run=False):
                         "捏合长按 = 按住左键（持续开火），\n"
                         "建议开启头动光标+调低头动灵敏度。")
             self._help_tip = help_tip
-            self.help_label = ttk.Label(box3, text=self._help_text(),
-                                        justify="left", wraplength=280,
-                                        foreground="#d0d0e0")
-            self.help_label.pack(anchor="nw", padx=8, pady=6)
+            self.help_label = ttk.Label(tab3, text=self._help_text(),
+                                        justify="left", wraplength=290,
+                                        foreground="#d0d0e0",
+                                        font=("Microsoft YaHei UI", 10))
+            self.help_label.pack(anchor="nw", padx=8, pady=8)
 
         def _help_text(self):
             base = (self.help_dual if self.hands_var.get() == "dual"
@@ -2212,8 +2249,8 @@ def build_gui(dry_run=False):
             self._sync_settings()
             self._stop_worker()  # 清理旧线程
             self.frame_queue = queue.Queue(maxsize=2)
-            self.btn_start.config(text="■  停 止", state="normal")
-            self.status_bar.config(text="状态：正在打开摄像头…")
+            self.btn_start.config(text="■  停 止 识 别", style="Stop.TButton")
+            self.status_bar.config(text="● 正在打开摄像头…")
             self.worker = CameraWorker(
                 dict(self.settings),
                 on_frame=lambda payload: self._on_worker_frame(payload),
@@ -2227,8 +2264,8 @@ def build_gui(dry_run=False):
                 self.worker.request_stop()
                 self.worker.join(timeout=2.5)
                 self.worker = None
-            self.btn_start.config(text="▶  开 始 识 别")
-            self.status_bar.config(text="状态：已停止    |    引擎：-    |    FPS：-    |    手势：-")
+            self.btn_start.config(text="▶  开 始 识 别", style="Start.TButton")
+            self.status_bar.config(text="● 已停止    |    引擎：-    |    FPS：-    |    手势：-")
 
         def _sync_settings(self):
             self.settings["camera"] = self.cam_var.get()
@@ -2257,6 +2294,7 @@ def build_gui(dry_run=False):
 
         def _param_changed(self):
             self._sync_settings()
+            self._refresh_scale_labels()
             self.help_label.config(text=self._help_text())
             if self.worker and self.worker.is_alive():
                 self.worker.apply_settings(dict(self.settings))
@@ -2417,9 +2455,10 @@ def build_gui(dry_run=False):
             if s.get("head_on"):
                 face = "✓" if s.get("face") else "—"
                 hands_txt += "    |    头动·人脸:%s" % face
-            text = ("状态：%s    |    引擎：%s    |    FPS：%.0f    |    "
-                    "手势：%s（%s）%s" % (state, s["engine"], s["fps"], g, hand,
-                                          hands_txt))
+            text = ("%s %s    |    引擎：%s    |    FPS：%.0f    |    "
+                    "手势：%s（%s）%s" % (
+                        "🟢" if running else "⚪", state, s["engine"], s["fps"],
+                        g, hand, hands_txt))
             # 只在内容变化时更新控件，避免每帧无谓的字符串重绘
             if text != getattr(self, "_last_status_text", None):
                 self.status_bar.config(text=text)
