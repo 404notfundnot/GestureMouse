@@ -57,7 +57,7 @@ import cv2
 import numpy as np
 
 APP_NAME = "手势鼠标 GestureMouse"
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 if getattr(sys, "frozen", False):
     # PyInstaller 打包运行：资源（模型/设置）与 exe 同目录
@@ -69,10 +69,11 @@ SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 DEFAULT_SETTINGS = {
     "camera": "auto",          # 摄像头索引：auto / 0 / 1 / 2 / 3
     "engine": "auto",          # auto / mediapipe / skin
-    "hands_mode": "dual",      # dual 双手模式（右移左点） / single 单手模式
+    "hands_mode": "dual",      # dual 双手模式 / gaze 眼动模式 / single 单手模式
     "sensitivity": 1.0,        # 光标灵敏度（绝对模式：映射倍数；相对模式：速度倍率）
     "touch_sensitivity": 0.55, # 触摸灵敏度：拇指与指尖判定为"触摸"的距离阈值倍数
     "scroll_speed": 1.0,      # 滚轮速度倍率（4 指滚轮 / 拇指触摸上下滑）
+    "gaze_sensitivity": 2.5,   # 眼动模式：注视偏移放大增益
     "smoothing": 0.35,         # 平滑度 EMA 系数
     "mode": "absolute",        # absolute 绝对定位 / relative 相对移动（触摸板式）
     "mirror": True,            # 镜像画面
@@ -265,6 +266,12 @@ class GestureResult:
     def __init__(self):
         self.hands = []                 # HandInfo 列表（0~2 只手）
         self.engine_name = ""
+        # 眼动模式数据
+        self.gaze_point = None          # (rx, ry) 虹膜在眼内的位置比例（0~1）
+        self.gaze_valid = False         # 当前帧注视有效（有人脸且未眨眼）
+        self.face_found = False
+        self.blink = False
+        self.eye_pts = []               # 每眼 [外角,内角,上睑,下睑,虹膜] 归一化点
 
     def hand(self, label):
         """取用户视角的某只手；label: 'left' / 'right'。"""
@@ -613,6 +620,115 @@ def _angle_between(a, p, b):
 
 
 # ---------------------------------------------------------------------------
+# 引擎 3：眼动追踪（MediaPipe FaceLandmarker 虹膜关键点）
+# ---------------------------------------------------------------------------
+class GazeEngine:
+    """眼动追踪：虹膜在外眼角-内眼角连线上的投影比例 -> 注视方向。
+
+    头部基本正对摄像头时，比例法对头部平移/小幅转动天然鲁棒
+    （眼角随头部一起移动）。眨眼时虹膜不可靠，返回无效。
+    """
+
+    name = "眼动追踪"
+    MODEL_NAME = "face_landmarker.task"
+
+    # 每只眼睛关键点索引：外眼角, 内眼角, 虹膜中心, 上眼睑, 下眼睑
+    EYES = [
+        (33, 133, 468, 159, 145),    # 画面左侧的眼睛
+        (263, 362, 473, 386, 374),   # 画面右侧的眼睛
+    ]
+    BLINK_DIST = 0.004   # 上下眼睑归一化距离小于此 -> 视为闭眼（睁眼约 0.006~0.012）
+
+    def __init__(self):
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+        except ImportError:
+            raise RuntimeError("眼动模式需要 mediapipe 包（未安装）")
+        self.mp = mp
+        self.vision = vision
+        model_path = os.path.join(BASE_DIR, self.MODEL_NAME)
+        if not os.path.isfile(model_path):
+            raise RuntimeError(
+                "缺少模型文件 %s，请将其放到程序目录下。\n"
+                "下载地址：https://storage.googleapis.com/mediapipe-models/"
+                "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+                % self.MODEL_NAME
+            )
+        self.landmarker = vision.FaceLandmarker.create_from_options(
+            vision.FaceLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=model_path),
+                running_mode=vision.RunningMode.VIDEO,
+                num_faces=1,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        )
+        self._ts = 0
+
+    def close(self):
+        try:
+            self.landmarker.close()
+        except Exception:
+            pass
+
+    def detect(self, frame_rgb, mirror=True):
+        """返回 (gaze_point, info)。
+
+        gaze_point: (rx, ry) 虹膜在眼内位置比例（0~1，0.5=正视），
+                    无人脸或眨眼时返回 None。
+        info: {"face": bool, "blink": bool, "eye_pts": [...]}
+        """
+        info = {"face": False, "blink": False, "eye_pts": []}
+        img = self.mp.Image(image_format=self.mp.ImageFormat.SRGB,
+                            data=np.ascontiguousarray(frame_rgb))
+        ts = int(time.monotonic() * 1000)
+        if ts <= self._ts:
+            ts = self._ts + 1
+        self._ts = ts
+        result = self.landmarker.detect_for_video(img, ts)
+        if not result.face_landmarks:
+            return None, info
+        info["face"] = True
+        lm = result.face_landmarks[0]
+
+        ratios_x, ratios_y = [], []
+        blinks = 0
+        eye_pts = []
+        for outer, inner, iris, up, dn in self.EYES:
+            ox, oy = lm[outer].x, lm[outer].y
+            ix, iy = lm[inner].x, lm[inner].y
+            px, py = lm[iris].x, lm[iris].y
+            uy_ = lm[up].y
+            dy_ = lm[dn].y
+            # x：虹膜在外角->内角连线上的投影比例
+            ux, uy = ix - ox, iy - oy
+            ulen = math.hypot(ux, uy)
+            if ulen > 1e-6:
+                rx = ((px - ox) * ux + (py - oy) * uy) / (ulen * ulen)
+                ratios_x.append(rx)
+            # y：虹膜在上下眼睑之间的比例
+            span = dy_ - uy_
+            if abs(span) > 1e-6:
+                ratios_y.append((py - uy_) / span)
+            if span < self.BLINK_DIST:
+                blinks += 1
+            eye_pts.append(((ox, oy), (ix, iy), (lm[up].x, lm[up].y),
+                            (lm[dn].x, lm[dn].y), (px, py)))
+        info["eye_pts"] = eye_pts
+        if not ratios_x or not ratios_y or blinks >= 2:
+            info["blink"] = True
+            return None, info
+        rx = sum(ratios_x) / len(ratios_x)
+        ry = sum(ratios_y) / len(ratios_y)
+        return (min(1.0, max(0.0, rx)), min(1.0, max(0.0, ry))), info
+
+
+# ---------------------------------------------------------------------------
 # 引擎工厂
 # ---------------------------------------------------------------------------
 def make_engine(kind="auto"):
@@ -757,8 +873,9 @@ class GestureInterpreter:
 
     # -- 主循环 --------------------------------------------------------------
     def update(self, res, dt=None):
-        if self.settings.get("hands_mode", "single") == "dual":
-            return self._update_dual(res, dt)
+        mode = self.settings.get("hands_mode", "single")
+        if mode in ("dual", "gaze"):
+            return self._update_dual(res, dt, use_gaze=(mode == "gaze"))
         return self._update_single(res, dt)
 
     def _smooth_pointer(self, pointer):
@@ -807,8 +924,9 @@ class GestureInterpreter:
             self.on_event(eff, self.px, self.py)
         return eff
 
-    def _update_dual(self, res, dt=None):
-        """双手模式：右手（用户视角）移动光标，左手手势触发动作。"""
+    def _update_dual(self, res, dt=None, use_gaze=False):
+        """双手/眼动模式：指针来源（右手指尖或眼睛注视）移动光标，
+        左手手势触发动作（两种模式左手逻辑完全一致）。"""
         now = time.perf_counter()
         if dt is None:
             dt = max(now - self.last_t, 1e-4)
@@ -823,9 +941,17 @@ class GestureInterpreter:
             self.touch_release_at = now
         self.prev_thumb_touch = cur_touch
 
-        # 右手在场：平滑跟随食指尖
-        if right is not None:
-            self._smooth_pointer(right.pointer)
+        if use_gaze:
+            # 眼动模式：注视有效时，眼内比例 -> 屏幕坐标（增益放大）
+            if res.gaze_valid and res.gaze_point is not None:
+                gain = float(self.settings.get("gaze_sensitivity", 2.5))
+                nx = min(1.0, max(0.0, 0.5 + (res.gaze_point[0] - 0.5) * gain))
+                ny = min(1.0, max(0.0, 0.5 + (res.gaze_point[1] - 0.5) * gain))
+                self._smooth_pointer((nx, ny))
+        else:
+            # 双手模式：右手在场时平滑跟随食指尖
+            if right is not None:
+                self._smooth_pointer(right.pointer)
         # 左手在场：独立平滑（滚轮方向用）
         if left is not None:
             self._smooth_left_pointer(left.pointer)
@@ -857,9 +983,13 @@ class GestureInterpreter:
 
         eff = self.eff
 
-        # 右手在场时持续移动光标（拖拽、滚轮时亦然，互不冲突）
-        if right is not None:
-            self._do_move(dt)
+        # 指针可用时持续移动光标（拖拽、滚轮时亦然，互不冲突）
+        if use_gaze:
+            if res.gaze_valid and res.gaze_point is not None:
+                self._do_move(dt)
+        else:
+            if right is not None:
+                self._do_move(dt)
         if eff == GESTURE_SCROLL:
             self._do_scroll_locked(dt, use_left=(left is not None),
                                    raw_y=(left.pointer[1] if left is not None else None))
@@ -1009,6 +1139,7 @@ class CameraWorker(threading.Thread):
     def run(self):
         cap = None
         engine = None
+        gaze_engine = None
         interp = None
         mouse = DryRunMouse() if self.dry_run else MouseController()
         try:
@@ -1056,12 +1187,38 @@ class CameraWorker(threading.Thread):
                     frame = cv2.flip(frame, 1)
 
                 touch_thr = float(cur.get("touch_sensitivity", 0.55))
+                rgb = None
                 if engine.name == "MediaPipe":
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     res = engine.detect(rgb, mirror=mirror,
                                         touch_threshold=touch_thr)
                 else:
                     res = engine.detect(frame, mirror=mirror)
+
+                # 眼动模式：并行运行人脸/虹膜检测，填入注视数据
+                gaze_mode = cur.get("hands_mode") == "gaze"
+                if gaze_mode:
+                    if gaze_engine is None:
+                        try:
+                            gaze_engine = GazeEngine()
+                        except Exception:
+                            gaze_engine = False   # 初始化失败：仅手部逻辑
+                    if gaze_engine not in (None, False):
+                        if rgb is None:
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        gp, ginfo = gaze_engine.detect(rgb, mirror=mirror)
+                        res.gaze_point = gp
+                        res.gaze_valid = gp is not None and not ginfo.get("blink")
+                        res.face_found = bool(ginfo.get("face"))
+                        res.blink = bool(ginfo.get("blink"))
+                        res.eye_pts = ginfo.get("eye_pts", [])
+                else:
+                    if gaze_engine not in (None, False):
+                        try:
+                            gaze_engine.close()
+                        except Exception:
+                            pass
+                        gaze_engine = None
 
                 eff = interp.update(res, dt)
 
@@ -1096,6 +1253,9 @@ class CameraWorker(threading.Thread):
                     "hands_mode": hands_mode,
                     "left": res.hand("left") is not None,
                     "right": res.hand("right") is not None,
+                    "face": res.face_found,
+                    "blink": res.blink,
+                    "gaze_valid": res.gaze_valid,
                 }
                 payload = {"frames": frames, "info": info}
                 with self._lock:
@@ -1111,6 +1271,11 @@ class CameraWorker(threading.Thread):
             if interp is not None:
                 try:
                     interp.reset()
+                except Exception:
+                    pass
+            if gaze_engine not in (None, False):
+                try:
+                    gaze_engine.close()
                 except Exception:
                     pass
             if engine is not None:
@@ -1181,8 +1346,8 @@ def _annotate(frame, res, gesture, fps, engine_name, show_lm, show_hint,
     out = frame.copy()
     h, w = out.shape[:2]
 
-    if hands_mode == "dual" and res.hands:
-        # 双手模式：左手蓝、右手绿（即使只检测到一只手也按左右着色）
+    if hands_mode in ("dual", "gaze") and res.hands:
+        # 双手/眼动模式：左手蓝、右手绿（即使只检测到一只手也按左右着色）
         color_map = {"left": (255, 160, 60), "right": (0, 255, 0)}
         for hand in res.hands:
             color = color_map.get(hand.label, (200, 200, 200))
@@ -1192,8 +1357,8 @@ def _annotate(frame, res, gesture, fps, engine_name, show_lm, show_hint,
                     cv2.line(out, pts[a], pts[b], color, 2)
                 for p in pts:
                     cv2.circle(out, p, 4, color, -1)
-            # 右手是光标手：画黄色目标圈
-            if hand.label == "right":
+            # 双手模式右手是光标手：画黄色目标圈（眼动模式无右手光标）
+            if hands_mode == "dual" and hand.label == "right":
                 px, py = int(hand.pointer[0] * w), int(hand.pointer[1] * h)
                 cv2.circle(out, (px, py), 8, (0, 255, 255), -1)
                 cv2.circle(out, (px, py), 14, (0, 255, 255), 2)
@@ -1210,22 +1375,45 @@ def _annotate(frame, res, gesture, fps, engine_name, show_lm, show_hint,
             for p in pts:
                 cv2.circle(out, p, 4, (0, 0, 255), -1)
 
+    if hands_mode == "gaze" and res.eye_pts and show_lm:
+        # 眼动模式：画眼睛（眼角连线、眼睑、虹膜）+ 注视点
+        for (ox, oy), (ix, iy), (ux, uy), (dx, dy), (px, py) in res.eye_pts:
+            o = (int(ox * w), int(oy * h))
+            i = (int(ix * w), int(iy * h))
+            u = (int(ux * w), int(uy * h))
+            d = (int(dx * w), int(dy * h))
+            p = (int(px * w), int(py * h))
+            cv2.line(out, o, i, (0, 255, 255), 1)
+            cv2.line(out, u, d, (255, 200, 200), 1)
+            cv2.circle(out, p, 5, (0, 255, 255), 2)
+        if res.gaze_valid and res.gaze_point is not None:
+            gx, gy = int(res.gaze_point[0] * w), int(res.gaze_point[1] * h)
+            cv2.circle(out, (gx, gy), 10, (0, 255, 128), 2)
+            cv2.line(out, (gx - 14, gy), (gx + 14, gy), (0, 255, 128), 1)
+            cv2.line(out, (gx, gy - 14), (gx, gy + 14), (0, 255, 128), 1)
+
     if show_hint:
         label = "Gesture: %s" % _gesture_en(res, gesture)
-        if hands_mode == "dual":
+        if hands_mode in ("dual", "gaze"):
             left = res.hand("left")
             right = res.hand("right")
             l_txt = ("L:%d" % left.count) if left is not None else "L:--"
             if left is not None and left.thumb_touch:
                 touch_names = {1: "IDX", 2: "MID", 3: "RNG", 4: "PNK"}
                 l_txt += "+%s" % touch_names.get(left.thumb_touch, "?")
-            r_txt = ("R:%d" % right.count) if right is not None else "R:--"
-            label = "%s  [%s %s]" % (label, l_txt, r_txt)
+            if hands_mode == "dual":
+                r_txt = ("R:%d" % right.count) if right is not None else "R:--"
+                label = "%s  [%s %s]" % (label, l_txt, r_txt)
+            else:
+                face_txt = ("FACE:%s" % ("OK" if res.face_found else "--"))
+                blink_txt = (" BLINK" if res.blink else "")
+                label = "%s  [%s %s%s]" % (label, l_txt, face_txt, blink_txt)
         cv2.rectangle(out, (8, 8), (w - 8, 40), (30, 30, 30), -1)
         cv2.putText(out, label, (16, 32), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (0, 255, 128), 2, cv2.LINE_AA)
+        mode_txt = {"dual": "DUAL", "gaze": "GAZE", "single": "SINGLE"}
         fps_txt = "FPS %.1f | %s | %s" % (fps, engine_name,
-                                          "DUAL" if hands_mode == "dual" else "SINGLE")
+                                          mode_txt.get(hands_mode, "?"))
         cv2.putText(out, fps_txt, (16, h - 12), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, (255, 255, 255), 1, cv2.LINE_AA)
     return out
@@ -1330,7 +1518,22 @@ def build_gui(dry_run=False):
 
         def set_gesture(self, info):
             g = info.get("gesture", GESTURE_NONE)
-            if not info.get("hand"):
+            hands_mode = info.get("hands_mode", "dual")
+            if hands_mode == "gaze":
+                if not info.get("face"):
+                    self.gesture_label.config(text="未检测到人脸 · 光标已冻结",
+                                              fg="#9e9e9e")
+                    self.hint_label.config(text="请正对摄像头，保持光线充足")
+                elif info.get("blink"):
+                    self.gesture_label.config(text="眨眼中 · 光标已冻结",
+                                              fg="#9e9e9e")
+                    self.hint_label.config(text="睁开眼即恢复")
+                else:
+                    self.gesture_label.config(
+                        text=GESTURE_LABEL_CN.get(g, "?"),
+                        fg=GESTURE_COLOR_CN.get(g, "#9e9e9e"))
+                    self.hint_label.config(text="注视=移动 · " + GESTURE_HINT_CN.get(g, ""))
+            elif not info.get("hand"):
                 self.gesture_label.config(text="无手 · 鼠标已冻结", fg="#9e9e9e")
                 self.hint_label.config(text="手伸到摄像头前恢复控制")
             else:
@@ -1455,60 +1658,73 @@ def build_gui(dry_run=False):
                                            variable=self.hands_var, value="dual",
                                            command=self._param_changed)
             self.rb_dual.grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=1)
+            self.rb_gaze = ttk.Radiobutton(box2, text="眼动模式（眼睛指向 · 左手动作）",
+                                           variable=self.hands_var, value="gaze",
+                                           command=self._param_changed)
+            self.rb_gaze.grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=1)
             self.rb_single = ttk.Radiobutton(box2, text="单手模式（一只手全包）",
                                              variable=self.hands_var, value="single",
                                              command=self._param_changed)
-            self.rb_single.grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=1)
+            self.rb_single.grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=1)
 
-            ttk.Label(box2, text="灵敏度").grid(row=3, column=0, sticky="w", padx=6, pady=(4, 0))
+            ttk.Label(box2, text="灵敏度").grid(row=4, column=0, sticky="w", padx=6, pady=(4, 0))
             self.sens_var = tk.DoubleVar(value=float(self.settings.get("sensitivity", 1.0)))
             ttk.Scale(box2, from_=0.5, to=3.0, variable=self.sens_var,
                       command=lambda v: self._param_changed()).grid(
-                row=3, column=1, sticky="we", padx=6)
-            ttk.Label(box2, text="触摸灵敏度").grid(row=4, column=0, sticky="w", padx=6, pady=3)
+                row=4, column=1, sticky="we", padx=6)
+            ttk.Label(box2, text="触摸灵敏度").grid(row=5, column=0, sticky="w", padx=6, pady=3)
             self.touch_var = tk.DoubleVar(
                 value=float(self.settings.get("touch_sensitivity", 0.55)))
             ttk.Scale(box2, from_=0.3, to=0.9, variable=self.touch_var,
                       command=lambda v: self._param_changed()).grid(
-                row=4, column=1, sticky="we", padx=6, pady=3)
+                row=5, column=1, sticky="we", padx=6, pady=3)
             ttk.Label(box2, text="越小越需贴紧 · 越大越易触发",
                       foreground="#8888aa").grid(
-                row=5, column=0, columnspan=2, sticky="w", padx=6)
-            ttk.Label(box2, text="平滑度").grid(row=6, column=0, sticky="w", padx=6, pady=3)
+                row=6, column=0, columnspan=2, sticky="w", padx=6)
+            ttk.Label(box2, text="平滑度").grid(row=7, column=0, sticky="w", padx=6, pady=3)
             self.smooth_var = tk.DoubleVar(value=float(self.settings.get("smoothing", 0.35)))
             ttk.Scale(box2, from_=0.05, to=0.9, variable=self.smooth_var,
                       command=lambda v: self._param_changed()).grid(
-                row=6, column=1, sticky="we", padx=6, pady=3)
-            ttk.Label(box2, text="滚轮速度").grid(row=7, column=0, sticky="w", padx=6, pady=3)
+                row=7, column=1, sticky="we", padx=6, pady=3)
+            ttk.Label(box2, text="滚轮速度").grid(row=8, column=0, sticky="w", padx=6, pady=3)
             self.scroll_var = tk.DoubleVar(value=float(self.settings.get("scroll_speed", 1.0)))
             ttk.Scale(box2, from_=0.3, to=3.0, variable=self.scroll_var,
                       command=lambda v: self._param_changed()).grid(
-                row=7, column=1, sticky="we", padx=6, pady=3)
+                row=8, column=1, sticky="we", padx=6, pady=3)
+            ttk.Label(box2, text="眼动灵敏度").grid(row=9, column=0, sticky="w", padx=6, pady=3)
+            self.gaze_var = tk.DoubleVar(
+                value=float(self.settings.get("gaze_sensitivity", 2.5)))
+            ttk.Scale(box2, from_=1.5, to=4.0, variable=self.gaze_var,
+                      command=lambda v: self._param_changed()).grid(
+                row=9, column=1, sticky="we", padx=6, pady=3)
+            ttk.Label(box2, text="注视幅度放大倍率（眼动模式）",
+                      foreground="#8888aa").grid(
+                row=10, column=0, columnspan=2, sticky="w", padx=6)
 
             self.mode_var = tk.StringVar(value=self.settings.get("mode", "absolute"))
             ttk.Radiobutton(box2, text="绝对定位（手到哪光标到哪）",
                             variable=self.mode_var, value="absolute",
                             command=self._param_changed).grid(
-                row=8, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+                row=11, column=0, columnspan=2, sticky="w", padx=6, pady=2)
             ttk.Radiobutton(box2, text="相对移动（触摸板式）",
                             variable=self.mode_var, value="relative",
                             command=self._param_changed).grid(
-                row=9, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+                row=12, column=0, columnspan=2, sticky="w", padx=6, pady=2)
 
             self.mirror_var = tk.BooleanVar(value=bool(self.settings.get("mirror", True)))
             ttk.Checkbutton(box2, text="镜像画面（推荐开启）", variable=self.mirror_var,
                             command=self._param_changed).grid(
-                row=10, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+                row=13, column=0, columnspan=2, sticky="w", padx=6, pady=2)
             self.lm_var = tk.BooleanVar(value=bool(self.settings.get("show_landmarks", True)))
             ttk.Checkbutton(box2, text="显示手部标记", variable=self.lm_var,
                             command=self._param_changed).grid(
-                row=11, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
+                row=14, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
             self.monitor_var = tk.BooleanVar(
                 value=bool(self.settings.get("monitor_enabled", True)))
             ttk.Checkbutton(box2, text="右下角监视窗（悬浮置顶·可缩放）",
                             variable=self.monitor_var,
                             command=self._toggle_monitor).grid(
-                row=12, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 6))
+                row=15, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 6))
             box2.columnconfigure(1, weight=1)
 
             # 帮助
@@ -1525,6 +1741,20 @@ def build_gui(dry_run=False):
                 "左手 4 指            滚轮（进入时手在上/下半屏=上/下滚，方向锁定不随手动）\n"
                 "左手 1/2/3 指        左键 / 右键 / 双击（不变）\n\n"
                 "手离开画面          鼠标静止不误触"
+            )
+            self.help_gaze = (
+                "眼动模式：\n"
+                "眼睛看向哪        光标移动到哪\n"
+                "（头部尽量正对摄像头，注视方向\n"
+                "  由虹膜位置估计，画面黄圈=注视点）\n"
+                "左手手势 = 动作（与双手模式相同）：\n"
+                "拇指+食指触摸      单击（长按≈0.5秒=拖拽）\n"
+                "拇指+中指触摸      右键\n"
+                "拇指+无名指触摸    上滑\n"
+                "拇指+小指触摸      下滑\n"
+                "左手 1/2/3/4 指    左键/右键/双击/滚轮\n"
+                "左手 5 指 / 握拳    无动作\n\n"
+                "无人脸/眨眼时      光标静止不误动"
             )
             self.help_single = (
                 "单手模式：\n"
@@ -1544,8 +1774,13 @@ def build_gui(dry_run=False):
             self.help_label.pack(anchor="nw", padx=8, pady=6)
 
         def _help_text(self):
-            base = (self.help_dual if self.hands_var.get() == "dual"
-                    else self.help_single)
+            mode = self.hands_var.get()
+            if mode == "gaze":
+                base = self.help_gaze
+            elif mode == "dual":
+                base = self.help_dual
+            else:
+                base = self.help_single
             return base + self._help_tip
 
         def _update_engine_note(self):
@@ -1591,6 +1826,7 @@ def build_gui(dry_run=False):
             self.settings["sensitivity"] = round(float(self.sens_var.get()), 2)
             self.settings["touch_sensitivity"] = round(float(self.touch_var.get()), 2)
             self.settings["scroll_speed"] = round(float(self.scroll_var.get()), 2)
+            self.settings["gaze_sensitivity"] = round(float(self.gaze_var.get()), 2)
             self.settings["smoothing"] = round(float(self.smooth_var.get()), 2)
             self.settings["mode"] = self.mode_var.get()
             self.settings["mirror"] = bool(self.mirror_var.get())
@@ -1717,6 +1953,10 @@ def build_gui(dry_run=False):
                 hands_txt = "    |    左手:%s 右手:%s" % (
                     "✓" if s.get("left") else "—",
                     "✓" if s.get("right") else "—")
+            elif s.get("hands_mode") == "gaze":
+                face = "✓" if s.get("face") else "—"
+                blink = "眨眼中" if s.get("blink") else "正常"
+                hands_txt = "    |    人脸:%s 眼睛:%s" % (face, blink)
             text = ("状态：%s    |    引擎：%s    |    FPS：%.0f    |    "
                     "手势：%s（%s）%s" % (state, s["engine"], s["fps"], g, hand,
                                           hands_txt))

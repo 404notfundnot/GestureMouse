@@ -37,6 +37,13 @@ def step(interp, *hands, n=1):
         time.sleep(1/30)
 
 
+def step_res(interp, res, n=1):
+    """直接推一个已构造好的 GestureResult（眼动模式用）。"""
+    for _ in range(n):
+        interp.update(res, dt=1/30)
+        time.sleep(1/30)
+
+
 def cool():
     """模拟用户两次动作之间的自然间隔（超过点击冷却 0.7s）。"""
     time.sleep(0.9)
@@ -376,6 +383,52 @@ step(interp5, right5, left4, n=15)
 d = delta(mouse5, before)
 print("阶段S(滚轮速度2x) 增量:", d)
 assert d["scroll_sum"] >= 6           # 1x 时 15 帧约 3 格，2x 应约 6 格
+
+# ---------- 9. 眼动模式 ----------
+# 9a. GazeEngine 真实人脸照片检测
+ge = gm.GazeEngine()
+img_f = cv2.imread("_tests/test_face.jpg")
+gp, ginfo = ge.detect(cv2.cvtColor(img_f, cv2.COLOR_BGR2RGB), mirror=True)
+print("9a 人脸检测 face=%s blink=%s gaze=%s" %
+      (ginfo["face"], ginfo["blink"],
+       [round(v, 3) for v in gp] if gp else None))
+assert ginfo["face"] and not ginfo["blink"] and gp is not None
+ge.close()
+
+
+def make_gaze_result(gp, left=None):
+    r = gm.GestureResult()
+    r.hands = [left] if left is not None else []
+    r.gaze_point = gp
+    r.gaze_valid = gp is not None
+    r.face_found = gp is not None
+    return r
+
+
+# 阶段 T：眼动模式——注视移动光标，左手手势照常触发
+mouse6 = gm.DryRunMouse()
+interp6 = gm.GestureInterpreter(mouse6, dict(gm.DEFAULT_SETTINGS, hands_mode="gaze",
+                                             mode="absolute", smoothing=0.5,
+                                             gaze_sensitivity=2.5))
+# 注视右上（比例 0.6,0.4 -> 增益后 0.75,0.25）
+step_res(interp6, make_gaze_result((0.6, 0.4)), n=10)
+print("阶段T(眼动模式注视=移动) events:", dict(mouse6.events))
+assert mouse6.events["move"] > 5
+
+# 眨眼/无人脸 -> 光标静止
+before = dict(mouse6.events)
+step_res(interp6, make_gaze_result(None), n=8)
+d = delta(mouse6, before)
+print("阶段T(无人脸/眨眼=光标静止) 增量:", d)
+assert d["move"] == 0
+
+# 注视有效 + 左手 1 指 -> 左键单击（左手动作保留）
+cool(); before = dict(mouse6.events)
+left_t = make_hand("left", [False, True, False, False, False])
+step_res(interp6, make_gaze_result((0.6, 0.4), left=left_t), n=12)
+d = delta(mouse6, before)
+print("阶段T(眼动+左手1指=左键单击) 增量:", d)
+assert d["lclick"] == 1
 
 engine.close()
 skin.close()
