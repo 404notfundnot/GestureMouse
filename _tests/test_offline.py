@@ -10,6 +10,7 @@ except Exception:
     pass
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cv2
+import numpy as np
 import gesture_mouse as gm
 
 
@@ -37,10 +38,10 @@ def step(interp, *hands, n=1):
         time.sleep(1/30)
 
 
-def step_res(interp, res, n=1):
+def step_res(interp, res, n=1, allow_move=True):
     """直接推一个已构造好的 GestureResult（眼动模式用）。"""
     for _ in range(n):
-        interp.update(res, dt=1/30)
+        interp.update(res, dt=1/30, allow_move=allow_move)
         time.sleep(1/30)
 
 
@@ -77,27 +78,34 @@ step(interp, right, n=10)
 print("阶段A(仅右手) events:", dict(mouse.events))
 assert mouse.events["move"] > 5 and mouse.events["lclick"] == 0
 
-# 阶段 B：左手 1 指 -> 左键单击一次（保留的原手势）
+# 阶段 B：左手 1 指 -> 无动作（手指数手势已删除，仅保留捏合判定）
 left1 = make_hand("left", [False, True, False, False, False], pointer=(0.3, 0.4))
+before = dict(mouse.events)
 step(interp, left1, right, n=12)
-print("阶段B(左手1指) events:", dict(mouse.events))
-assert mouse.events["lclick"] == 1
+d = delta(mouse, before)
+print("阶段B(左手1指=无动作) 增量:", d)
+assert d["lclick"] == 0 and d["rclick"] == 0 and d["dclick"] == 0 \
+    and d["scroll"] == 0 and d["down"] == 0
 
-# 阶段 C：左手 2 指 -> 右键单击（保留的原手势）
+# 阶段 C：左手 2 指 -> 无动作
 cool(); step(interp, right, n=6)
 left2 = make_hand("left", [False, True, True, False, False])
+before = dict(mouse.events)
 step(interp, left2, right, n=12)
-print("阶段C(左手2指) events:", dict(mouse.events))
-assert mouse.events["rclick"] == 1
+d = delta(mouse, before)
+print("阶段C(左手2指=无动作) 增量:", d)
+assert d["lclick"] == 0 and d["rclick"] == 0 and d["scroll"] == 0
 
-# 阶段 D：左手 3 指 -> 双击（保留的原手势）
+# 阶段 D：左手 3 指 -> 无动作
 cool(); step(interp, right, n=6)
 left3 = make_hand("left", [False, True, True, True, False])
+before = dict(mouse.events)
 step(interp, left3, right, n=12)
-print("阶段D(左手3指) events:", dict(mouse.events))
-assert mouse.events["dclick"] == 1
+d = delta(mouse, before)
+print("阶段D(左手3指=无动作) 增量:", d)
+assert d["dclick"] == 0 and d["lclick"] == 0 and d["scroll"] == 0
 
-# 阶段 E：左手 5 指张开 -> 无动作（拖拽改用拇+食指长按，阶段 I 覆盖）
+# 阶段 E：左手 5 指张开 -> 无动作
 cool(); step(interp, right, n=8)
 before = dict(mouse.events)
 left5 = make_hand("left", [True, True, True, True, True])
@@ -107,28 +115,20 @@ print("阶段E(左手5指张开=无动作) 增量:", d)
 assert d["down"] == 0 and d["up"] == 0 and d["lclick"] == 0 \
     and d["rclick"] == 0 and d["dclick"] == 0 and d["scroll"] == 0
 
-# 阶段 F：左手 4 指 -> 滚轮（方向锁定：进入瞬间所在半屏决定方向）
+# 阶段 F：左手 4 指 -> 无动作（滚轮已由拇+无名指/小指承担）
 cool(); step(interp, right, n=8)
 before = dict(mouse.events)
 left4 = make_hand("left", [False, True, True, True, True], pointer=(0.3, 0.2))
-step(interp, left4, right, n=12)      # 上半屏进入 -> 锁定上滚
+step(interp, left4, right, n=12)
 d1 = delta(mouse, before)
-print("阶段F(4指上半屏进入=上滚) 增量:", d1)
-assert d1["scroll"] >= 1 and d1["scroll_sum"] > 0
-# 关键：期间手移到下半屏，方向必须不变（修复"滚轮乱动"）
+print("阶段F(4指上半屏=无动作) 增量:", d1)
+assert d1["scroll"] == 0 and d1["scroll_sum"] == 0
 before = dict(mouse.events)
 left4b = make_hand("left", [False, True, True, True, True], pointer=(0.3, 0.85))
 step(interp, left4b, right, n=12)
 d2 = delta(mouse, before)
-print("阶段F(期间手移到下半屏,方向应保持不变) 增量:", d2)
-assert d2["scroll_sum"] > 0           # 仍向上滚，不随手位置翻转
-# 收起手势后在下半屏重新进入 -> 锁定下滚
-cool(); step(interp, right, n=8)
-before = dict(mouse.events)
-step(interp, left4b, right, n=12)
-d3 = delta(mouse, before)
-print("阶段F(下半屏重新进入=下滚) 增量:", d3)
-assert d3["scroll_sum"] < 0
+print("阶段F(4指下半屏=无动作) 增量:", d2)
+assert d2["scroll"] == 0 and d2["scroll_sum"] == 0
 
 # ---------- 3. 新增：拇指触摸系列 ----------
 # 阶段 H：拇指+食指 短触摸（0.2s）-> 单击
@@ -195,10 +195,10 @@ d2 = delta(mouse, before)
 print("阶段O(松开变4指,冷静期内应基本不滚) 增量:", d2)
 assert d2["scroll"] <= 2              # 仅防抖窗口惯性，不得持续滚动
 before = dict(mouse.events)
-step(interp, left4b, right, n=24)     # 越过冷静期+滚轮确认期，4 指正常生效（下半屏=下滚）
+step(interp, left4b, right, n=24)     # 4 指持续保持：始终无动作（手指数手势已删除）
 d3 = delta(mouse, before)
-print("阶段O(冷静期过后4指恢复生效) 增量:", d3)
-assert d3["scroll_sum"] < 0
+print("阶段O(松开后4指始终无动作) 增量:", d3)
+assert d3["scroll_sum"] == 0
 
 # 阶段 G：双手都不在 -> 一切静止（先稳定回无动作态再测）
 step(interp, right, n=8)
@@ -218,15 +218,8 @@ d = delta(mouse, before)
 print("阶段P(快速两连捏=两次单击) 增量:", d)
 assert d["lclick"] == 2            # 两次单击间隔 <0.5s，系统识别为双击
 
-# 阶段 Q：连续两次 3 指双击（间隔约 0.9s）-> 两次双击（独立冷却 0.4s 生效）
-cool(); step(interp, right, n=8)
-before = dict(mouse.events)
-step(interp, left3, right, n=12)   # 第一次双击
-step(interp, right, n=8)
-step(interp, left3, right, n=12)   # 冷却后第二次双击
-d = delta(mouse, before)
-print("阶段Q(连续两次双击) 增量:", d)
-assert d["dclick"] == 2
+# 阶段 Q 已删除：双手模式左手 3 指双击手势随"手指数判定"一起删除，
+# 双击现在通过"快速两连捏"（阶段 P）由系统合成。
 
 # 阶段 M：捏合释放防抖（识别闪断 1 帧不应误触发单击/拖拽）
 cool(); step(interp, right, n=8)
@@ -239,19 +232,8 @@ d = delta(mouse, before)
 print("阶段M(捏合闪断1帧不误触发) 增量:", d)
 assert d["lclick"] == 1 and d["down"] == 0
 
-# 阶段 N：方向锁定用原始位置（EMA 平滑惯性不应导致方向锁反）
-mouse4 = gm.DryRunMouse()
-interp4 = gm.GestureInterpreter(mouse4, dict(gm.DEFAULT_SETTINGS, hands_mode="dual",
-                                             mode="absolute", smoothing=0.05))
-right4 = make_hand("right", [False, True, False, False, False], pointer=(0.6, 0.5))
-hand_low = make_hand("left", [False] * 5, pointer=(0.3, 0.8))
-hand_high = make_hand("left", [False, True, True, True, True], pointer=(0.3, 0.2))
-step(interp4, right4, hand_low, n=6)        # 左手先停在下半屏（平滑值仍偏下）
-before = dict(mouse4.events)
-step(interp4, right4, hand_high, n=12)      # 4 指滚轮，手瞬移到上半屏
-d = delta(mouse4, before)
-print("阶段N(平滑惯性下方向锁定应=上滚) 增量:", d)
-assert d["scroll_sum"] > 0
+# 阶段 N 已删除：4 指滚轮方向锁定随"手指数手势"一起删除，
+# 滚轮现在只有拇+无名指（上滑）/拇+小指（下滑）。
 
 # ---------- 4. 单手模式回归（不变） ----------
 mouse2 = gm.DryRunMouse()
@@ -372,78 +354,179 @@ print("阶段R(握拳=无动作) 增量:", d)
 assert d["lclick"] == 0 and d["down"] == 0 and d["up"] == 0 \
     and d["scroll"] == 0
 
-# 阶段 S：滚轮速度设置生效（scroll_speed=2.0 约为 1.0 的两倍）
+# 阶段 S：滚轮速度设置生效（scroll_speed=2.0 约为 1.0 的两倍，用拇+无名指上滑验证）
 mouse5 = gm.DryRunMouse()
 interp5 = gm.GestureInterpreter(mouse5, dict(gm.DEFAULT_SETTINGS, hands_mode="dual",
                                              scroll_speed=2.0, mode="absolute"))
 right5 = make_hand("right", [False, True, False, False, False], pointer=(0.6, 0.5))
-step(interp5, right5, left4, n=8)     # left4: 4 指上半屏（阶段 F 定义）
+step(interp5, right5, pinch3, n=8)     # pinch3: 拇+无名指（阶段 K 定义）
 before = dict(mouse5.events)
-step(interp5, right5, left4, n=15)
+step(interp5, right5, pinch3, n=15)
 d = delta(mouse5, before)
-print("阶段S(滚轮速度2x) 增量:", d)
-assert d["scroll_sum"] >= 6           # 1x 时 15 帧约 3 格，2x 应约 6 格
+print("阶段S(滚轮速度2x,拇+无名指上滑) 增量:", d)
+assert d["scroll_sum"] >= 6           # 1x 时 15 帧约 6 格，2x 应约 12 格
 
-# ---------- 9. 眼动模式 ----------
-# 9a. GazeEngine 真实人脸照片检测
-ge = gm.GazeEngine()
+# ---------- 9. 头动模式 ----------
+# 9a. HeadPoseEngine 真实人脸照片检测（矩阵角度版）
+ge = gm.HeadPoseEngine()
 img_f = cv2.imread("_tests/test_face.jpg")
 gp, ginfo = ge.detect(cv2.cvtColor(img_f, cv2.COLOR_BGR2RGB), mirror=True)
-print("9a 人脸检测 face=%s blink=%s gaze=%s" %
-      (ginfo["face"], ginfo["blink"],
-       [round(v, 3) for v in gp] if gp else None))
-assert ginfo["face"] and not ginfo["blink"] and gp is not None
+print("9a 人脸检测 face=%s pose(rad)=%s" %
+      (ginfo["face"], [round(v, 3) for v in gp] if gp else None))
+assert ginfo["face"] and gp is not None
+# 正脸照片：yaw/pitch 应接近 0 弧度
+assert abs(gp[0]) < 0.15 and abs(gp[1]) < 0.2
 ge.close()
 
-
-def make_gaze_result(gp, left=None):
-    r = gm.GestureResult()
-    r.hands = [left] if left is not None else []
-    r.gaze_point = gp
-    r.gaze_valid = gp is not None
-    r.face_found = gp is not None
-    return r
+# 9b. 矩阵角度提取轴向验证（合成旋转矩阵）
+# 点头=绕水平轴 Rx，转头=绕竖直轴 Rz
+def Rx(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
 
 
-# 阶段 T：眼动模式——注视移动光标，左手手势照常触发
-mouse6 = gm.DryRunMouse()
-interp6 = gm.GestureInterpreter(mouse6, dict(gm.DEFAULT_SETTINGS, hands_mode="gaze",
-                                             mode="absolute", smoothing=0.5,
-                                             gaze_sensitivity=2.5))
-# 注视右上（比例 0.6,0.4 -> 增益后 0.75,0.25）
-step_res(interp6, make_gaze_result((0.6, 0.4)), n=10)
-print("阶段T(眼动模式注视=移动) events:", dict(mouse6.events))
-assert mouse6.events["move"] > 5
+def Rz(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
-# 眨眼/无人脸 -> 光标静止
-before = dict(mouse6.events)
-step_res(interp6, make_gaze_result(None), n=8)
-d = delta(mouse6, before)
-print("阶段T(无人脸/眨眼=光标静止) 增量:", d)
-assert d["move"] == 0
 
-# 注视有效 + 左手 1 指 -> 左键单击（左手动作保留）
-cool(); before = dict(mouse6.events)
-left_t = make_hand("left", [False, True, False, False, False])
-step_res(interp6, make_gaze_result((0.6, 0.4), left=left_t), n=12)
-d = delta(mouse6, before)
-print("阶段T(眼动+左手1指=左键单击) 增量:", d)
-assert d["lclick"] == 1
+M9 = np.eye(4)
+M9[:3, :3] = Rz(0.3) @ Rx(0.2)     # 转头 0.3 rad + 点头 0.2 rad
+yaw9, pitch9 = gm.HeadPoseEngine._angles_from_matrix(M9)
+print("9b 合成矩阵 yaw=%.3f(期望0.3) pitch=%.3f(期望0.2)" % (yaw9, pitch9))
+assert abs(yaw9 - 0.3) < 0.01 and abs(pitch9 - 0.2) < 0.01
+# 纯点头：yaw 应为 0
+M9b = np.eye(4)
+M9b[:3, :3] = Rx(0.25)
+yaw9b, pitch9b = gm.HeadPoseEngine._angles_from_matrix(M9b)
+print("9b 纯点头 yaw=%.3f(期望0) pitch=%.3f(期望0.25)" % (yaw9b, pitch9b))
+assert abs(yaw9b) < 0.01 and abs(pitch9b - 0.25) < 0.01
 
-# 阶段 U：标定映射路径（带 gaze_calib 时走个人化映射，不崩溃且移动正常）
+
+# ---------- 10. 头动独立逻辑（HeadController 与手势解耦） ----------
+
+class FakeHeadEngine:
+    """模拟 HeadPoseEngine：按序列返回 (pose_ratio, info)。"""
+    def __init__(self, seq):
+        self.seq = seq
+        self.i = 0
+    def detect(self, rgb, mirror=True):
+        r = self.seq[min(self.i, len(self.seq) - 1)]
+        self.i += 1
+        return r
+    def close(self):
+        pass
+
+
+# 10a. HeadController：姿态有效 -> 独立移动鼠标（中值+EMA 平滑）
+mouse_g = gm.DryRunMouse()
+hc = gm.HeadController(dict(gm.DEFAULT_SETTINGS, smoothing=0.5,
+                            head_sensitivity=1.0), mouse_g)
+hc.engine = FakeHeadEngine([((0.4, 0.1), {"face": True, "face_pts": []})] * 30)
+info = {}
+for _ in range(15):
+    info = hc.process(np.zeros((480, 640, 3), dtype=np.uint8))
+print("10a 头动移动: move=%d valid=%s" % (mouse_g.events["move"], info["valid"]))
+assert mouse_g.events["move"] >= 5 and info["valid"]
+
+# 10b. 无人脸 -> 冻结，不移动
+gc2 = gm.HeadController(dict(gm.DEFAULT_SETTINGS, smoothing=0.5), gm.DryRunMouse())
+gc2.engine = FakeHeadEngine([(None, {"face": False, "face_pts": []})] * 10)
+for _ in range(10):
+    gc2.process(np.zeros((480, 640, 3), dtype=np.uint8))
+print("10b 无人脸冻结 move=%d" % gc2.mouse.events["move"])
+assert gc2.mouse.events["move"] == 0
+
+# 10c. 标定映射（个人化系数优先于线性增益，角度域）
 calib_pts = []
 for sx, sy in [(0.5, 0.5), (0.12, 0.12), (0.88, 0.12), (0.88, 0.88),
                (0.12, 0.88), (0.5, 0.12), (0.88, 0.5), (0.5, 0.88), (0.12, 0.5)]:
-    calib_pts.append((0.3 + 0.35 * sx - 0.08 * sy + 0.05 * sx * sy,
-                      0.5 + 0.3 * sy - 0.1 * sx + 0.02 * sx * sy, sx, sy))
-calib_coeffs = gm.GazeCalibrator.fit(calib_pts)
+    # 角度与屏幕坐标近似线性：yaw = (sx-0.5)*0.8, pitch = (sy-0.5)*0.6
+    calib_pts.append(((sx - 0.5) * 0.8, (sy - 0.5) * 0.6, sx, sy))
+calib_coeffs = gm.PoseCalibrator.fit(calib_pts)
 assert calib_coeffs is not None
-mouse7 = gm.DryRunMouse()
-interp7 = gm.GestureInterpreter(mouse7, dict(gm.DEFAULT_SETTINGS, hands_mode="gaze",
-                                             gaze_calib=calib_coeffs, smoothing=0.5))
-step_res(interp7, make_gaze_result((0.3 + 0.35 * 0.88, 0.5 + 0.3 * 0.12)), n=10)
-print("阶段U(标定映射) events:", dict(mouse7.events))
-assert mouse7.events["move"] > 5
+mouse_g3 = gm.DryRunMouse()
+hc3 = gm.HeadController(dict(gm.DEFAULT_SETTINGS, smoothing=0.5,
+                             head_calib=calib_coeffs), mouse_g3)
+hc3.engine = FakeHeadEngine([(((0.88 - 0.5) * 0.8, (0.12 - 0.5) * 0.6),
+                              {"face": True, "face_pts": []})] * 20)
+for _ in range(12):
+    hc3.process(np.zeros((480, 640, 3), dtype=np.uint8))
+print("10c 标定映射 move=%d" % mouse_g3.events["move"])
+assert mouse_g3.events["move"] >= 5
+
+# 10d. 解释器解耦：allow_move=False 时手势只做动作、不抢光标移动
+mouse6 = gm.DryRunMouse()
+interp6 = gm.GestureInterpreter(mouse6, dict(gm.DEFAULT_SETTINGS,
+                                             hands_mode="dual", smoothing=0.5))
+right6 = make_hand("right", [False, True, False, False, False], pointer=(0.7, 0.5))
+step_res(interp6, make_result(right6), n=10, allow_move=False)
+print("10d allow_move=False(右手在场但不动光标) events:", dict(mouse6.events))
+assert mouse6.events["move"] == 0
+# 左手捏合手势照常（手指数手势已删除，用拇+食指短触摸验证）
+cool(); before = dict(mouse6.events)
+left_t = make_hand("left", [False, False, True, True, True], thumb_touch=1)
+step_res(interp6, make_result(left_t, right6), n=8, allow_move=False)
+step_res(interp6, make_result(right6), n=8, allow_move=False)   # 松开 -> 单击
+d = delta(mouse6, before)
+print("10d 捏合单击(allow_move=False) 增量:", d)
+assert d["lclick"] == 1 and d["move"] == 0
+
+# 10e. 轻微持续转动：光标应持续响应（旧"增量死区"逻辑会完全卡住）
+mouse_h = gm.DryRunMouse()
+hc4 = gm.HeadController(dict(gm.DEFAULT_SETTINGS, smoothing=0.4,
+                             head_sensitivity=1.0), mouse_h)
+seq = []
+cur = 0.0
+for _ in range(40):
+    cur += 0.003              # 每帧缓慢右转 0.003 rad（约 0.17°）
+    seq.append(((cur, 0.0), {"face": True, "face_pts": []}))
+hc4.engine = FakeHeadEngine(seq)
+for _ in range(40):
+    hc4.process(np.zeros((480, 640, 3), dtype=np.uint8))
+print("10e 轻微持续转动 move=%d" % mouse_h.events["move"])
+assert mouse_h.events["move"] >= 15   # 旧逻辑下为 0
+
+# 10f. 完全静止：不应漂移（死区抑制微抖）
+mouse_i = gm.DryRunMouse()
+hc5 = gm.HeadController(dict(gm.DEFAULT_SETTINGS, smoothing=0.4), mouse_i)
+hc5.engine = FakeHeadEngine([((0.0, 0.0), {"face": True, "face_pts": []})] * 15)
+for _ in range(15):
+    hc5.process(np.zeros((480, 640, 3), dtype=np.uint8))
+print("10f 静止不漂移 move=%d" % mouse_i.events["move"])
+assert mouse_i.events["move"] <= 2   # 初始 0.5 中心到目标 0.5 的偏差为 0，不移动
+
+# 10g. 重置中心：自然坐姿不正对（姿态 0.1 rad）时一键归零
+mouse_j = gm.DryRunMouse()
+hc6 = gm.HeadController(dict(gm.DEFAULT_SETTINGS, smoothing=0.4,
+                             head_sensitivity=1.0), mouse_j)
+hc6.engine = FakeHeadEngine([((0.1, 0.04), {"face": True, "face_pts": []})] * 60)
+for _ in range(12):
+    hc6.process(np.zeros((480, 640, 3), dtype=np.uint8))
+print("10g 重置前 last_pos=%.3f,%.3f" % mouse_j.last_pos)
+assert mouse_j.last_pos[0] > 0.52          # 头微侧 -> 光标偏右
+hc6.recenter()                              # 当前姿态设为零点
+for _ in range(12):
+    hc6.process(np.zeros((480, 640, 3), dtype=np.uint8))
+print("10g 重置后 last_pos=%.3f,%.3f" % mouse_j.last_pos)
+assert abs(mouse_j.last_pos[0] - 0.5) < 0.02 and abs(mouse_j.last_pos[1] - 0.5) < 0.02
+
+# 阶段 V：游戏模式——左手 4 指（无拇指）= Tab 锁定目标
+mouse8 = gm.DryRunMouse()
+interp8 = gm.GestureInterpreter(mouse8, dict(gm.DEFAULT_SETTINGS, hands_mode="dual",
+                                             game_mode=True))
+right8 = make_hand("right", [False, True, False, False, False])
+hand4 = make_hand("left", [False, True, True, True, True])
+step(interp8, right8, hand4, n=8)      # 防抖 0.1s 后进入
+step(interp8, right8, hand4, n=10)
+print("阶段V(游戏模式4指=Tab) events:", dict(mouse8.events))
+assert mouse8.events["key"] == 1
+# 非游戏模式：同样手势无动作
+mouse9 = gm.DryRunMouse()
+interp9 = gm.GestureInterpreter(mouse9, dict(gm.DEFAULT_SETTINGS, hands_mode="dual"))
+step(interp9, right8, hand4, n=12)
+print("阶段V(非游戏模式4指=无动作) key=%d" % mouse9.events["key"])
+assert mouse9.events["key"] == 0
 
 engine.close()
 skin.close()
