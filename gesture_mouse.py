@@ -74,6 +74,7 @@ DEFAULT_SETTINGS = {
     "touch_sensitivity": 0.55, # 触摸灵敏度：拇指与指尖判定为"触摸"的距离阈值倍数
     "scroll_speed": 1.0,      # 滚轮速度倍率（4 指滚轮 / 拇指触摸上下滑）
     "gaze_sensitivity": 2.5,   # 眼动模式：注视偏移放大增益
+    "gaze_calib": None,        # 眼动标定系数（12 个浮点，标定后自动写入）
     "smoothing": 0.35,         # 平滑度 EMA 系数
     "mode": "absolute",        # absolute 绝对定位 / relative 相对移动（触摸板式）
     "mirror": True,            # 镜像画面
@@ -310,6 +311,19 @@ class GestureResult:
         return self.main_hand().count
 
 
+def _to_short_path(path):
+    """中文路径转 Windows 8.3 短路径（mediapipe C API 不认中文路径）。"""
+    try:
+        if sys.platform == "win32" and not path.isascii():
+            buf = ctypes.create_unicode_buffer(512)
+            n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, 512)
+            if 0 < n < 512:
+                return buf.value
+    except Exception:
+        pass
+    return path
+
+
 # ---------------------------------------------------------------------------
 # 引擎 1：MediaPipe
 # ---------------------------------------------------------------------------
@@ -340,7 +354,8 @@ class MediaPipeEngine:
             )
         self.landmarker = vision.HandLandmarker.create_from_options(
             vision.HandLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=model_path),
+                base_options=mp_python.BaseOptions(
+                    model_asset_path=_to_short_path(model_path)),
                 running_mode=vision.RunningMode.VIDEO,
                 num_hands=2,
                 min_hand_detection_confidence=0.5,
@@ -622,6 +637,39 @@ def _angle_between(a, p, b):
 # ---------------------------------------------------------------------------
 # 引擎 3：眼动追踪（MediaPipe FaceLandmarker 虹膜关键点）
 # ---------------------------------------------------------------------------
+class GazeCalibrator:
+    """注视标定：二次多项式最小二乘拟合 (rx, ry) -> 屏幕坐标。
+
+    每个人的眼睛几何、坐姿、摄像头位置不同，线性固定增益必然不准；
+    标定后按个人注视特征映射，指向精度大幅提高。
+    """
+
+    @staticmethod
+    def fit(points):
+        """points: [(rx, ry, sx, sy), ...] 至少 6 个 -> 12 个系数或 None。"""
+        if len(points) < 6:
+            return None
+        A = np.zeros((len(points), 6), dtype=np.float64)
+        for i, (rx, ry, sx, sy) in enumerate(points):
+            A[i] = [1.0, rx, ry, rx * ry, rx * rx, ry * ry]
+        bx = np.array([p[2] for p in points], dtype=np.float64)
+        by = np.array([p[3] for p in points], dtype=np.float64)
+        try:
+            cx, *_ = np.linalg.lstsq(A, bx, rcond=None)
+            cy, *_ = np.linalg.lstsq(A, by, rcond=None)
+        except Exception:
+            return None
+        return [float(v) for v in list(cx) + list(cy)]
+
+    @staticmethod
+    def predict(coeffs, rx, ry):
+        """coeffs: 12 个系数（fit 输出）-> (sx, sy) 屏幕归一化坐标。"""
+        v = [1.0, rx, ry, rx * ry, rx * rx, ry * ry]
+        sx = sum(c * t for c, t in zip(coeffs[0:6], v))
+        sy = sum(c * t for c, t in zip(coeffs[6:12], v))
+        return min(1.0, max(0.0, sx)), min(1.0, max(0.0, sy))
+
+
 class GazeEngine:
     """眼动追踪：虹膜在外眼角-内眼角连线上的投影比例 -> 注视方向。
 
@@ -658,7 +706,8 @@ class GazeEngine:
             )
         self.landmarker = vision.FaceLandmarker.create_from_options(
             vision.FaceLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=model_path),
+                base_options=mp_python.BaseOptions(
+                    model_asset_path=_to_short_path(model_path)),
                 running_mode=vision.RunningMode.VIDEO,
                 num_faces=1,
                 output_face_blendshapes=False,
@@ -711,10 +760,12 @@ class GazeEngine:
             if ulen > 1e-6:
                 rx = ((px - ox) * ux + (py - oy) * uy) / (ulen * ulen)
                 ratios_x.append(rx)
-            # y：虹膜在上下眼睑之间的比例
+            # y：虹膜相对眼角连线中点的垂直偏移，用眼宽归一化
+            # （比上下眼睑距离稳定——眼睑开合/表情不影响基准）
+            line_y = (oy + iy) / 2.0
+            ry = (py - line_y) / max(ulen, 1e-6) + 0.5
+            ratios_y.append(ry)
             span = dy_ - uy_
-            if abs(span) > 1e-6:
-                ratios_y.append((py - uy_) / span)
             if span < self.BLINK_DIST:
                 blinks += 1
             eye_pts.append(((ox, oy), (ix, iy), (lm[up].x, lm[up].y),
@@ -942,11 +993,20 @@ class GestureInterpreter:
         self.prev_thumb_touch = cur_touch
 
         if use_gaze:
-            # 眼动模式：注视有效时，眼内比例 -> 屏幕坐标（增益放大）
+            # 眼动模式：注视有效时映射到屏幕坐标
+            # 有标定数据 -> 个人化二次多项式映射；否则线性 + 增益
             if res.gaze_valid and res.gaze_point is not None:
-                gain = float(self.settings.get("gaze_sensitivity", 2.5))
-                nx = min(1.0, max(0.0, 0.5 + (res.gaze_point[0] - 0.5) * gain))
-                ny = min(1.0, max(0.0, 0.5 + (res.gaze_point[1] - 0.5) * gain))
+                coeffs = self.settings.get("gaze_calib")
+                if coeffs and len(coeffs) == 12:
+                    nx, ny = GazeCalibrator.predict(coeffs,
+                                                    res.gaze_point[0],
+                                                    res.gaze_point[1])
+                else:
+                    gain = float(self.settings.get("gaze_sensitivity", 2.5))
+                    nx = min(1.0, max(0.0,
+                                      0.5 + (res.gaze_point[0] - 0.5) * gain))
+                    ny = min(1.0, max(0.0,
+                                      0.5 + (res.gaze_point[1] - 0.5) * gain))
                 self._smooth_pointer((nx, ny))
         else:
             # 双手模式：右手在场时平滑跟随食指尖
@@ -1220,7 +1280,9 @@ class CameraWorker(threading.Thread):
                             pass
                         gaze_engine = None
 
-                eff = interp.update(res, dt)
+                eff = GESTURE_NONE
+                if not cur.get("calibrating"):
+                    eff = interp.update(res, dt)
 
                 # FPS
                 frame_count += 1
@@ -1256,6 +1318,7 @@ class CameraWorker(threading.Thread):
                     "face": res.face_found,
                     "blink": res.blink,
                     "gaze_valid": res.gaze_valid,
+                    "gaze_ratio": res.gaze_point,   # 原始眼内比例（标定用）
                 }
                 payload = {"frames": frames, "info": info}
                 with self._lock:
@@ -1554,6 +1617,110 @@ def build_gui(dry_run=False):
                 except Exception:
                     pass
 
+    class CalibrationWindow(tk.Toplevel):
+        """全屏九点眼动标定：依次显示 9 个圆点，用户注视，
+        每点采集注视比例样本，完成后最小二乘拟合个人映射。"""
+
+        POINTS = [(0.5, 0.5), (0.12, 0.12), (0.88, 0.12), (0.88, 0.88),
+                  (0.12, 0.88), (0.5, 0.12), (0.88, 0.5), (0.5, 0.88),
+                  (0.12, 0.5)]
+        DWELL = 1.4        # 每点停留秒数
+        MIN_SAMPLES = 3    # 每点最少样本帧数
+
+        def __init__(self, master, on_done):
+            super().__init__(master)
+            self.on_done = on_done
+            try:
+                self.attributes("-fullscreen", True)
+                self.attributes("-topmost", True)
+            except Exception:
+                pass
+            self.configure(bg="#000000")
+            self.canvas = tk.Canvas(self, bg="#000000", highlightthickness=0)
+            self.canvas.pack(fill="both", expand=True)
+            self.info_label = tk.Label(
+                self, text="眼动标定：请注视屏幕上的蓝色圆点（Esc 取消）",
+                font=("Microsoft YaHei UI", 16), bg="#000000", fg="#ffffff")
+            self.info_label.pack(pady=16)
+            self.samples = []
+            self._cur = -1
+            self._dwell_start = 0.0
+            self._buf = []
+            self._aborted = False
+            self.protocol("WM_DELETE_WINDOW", self._abort)
+            self.bind("<Escape>", lambda e: self._abort())
+            self.after(50, self._tick)
+
+        def _tick(self):
+            if self._aborted:
+                return
+            # 采样：从主窗口帧队列取最新注视比例
+            try:
+                while True:
+                    payload = self.master.frame_queue.get_nowait()
+                    if self._cur >= 0 and payload["info"].get("gaze_valid") \
+                            and payload["info"].get("gaze_ratio"):
+                        self._buf.append(payload["info"]["gaze_ratio"])
+            except queue.Empty:
+                pass
+            if self._cur < 0:
+                self._next_point()
+            elif time.monotonic() - self._dwell_start >= self.DWELL:
+                self._collect()
+                if self._cur + 1 < len(self.POINTS):
+                    self._next_point()
+                else:
+                    self._finish()
+            self.after(50, self._tick)
+
+        def _next_point(self):
+            self._cur += 1
+            sx, sy = self.POINTS[self._cur]
+            self.canvas.delete("all")
+            w = self.canvas.winfo_width()
+            h = self.canvas.winfo_height()
+            if w < 100:
+                w, h = self.winfo_screenwidth(), self.winfo_screenheight()
+            x, y = int(sx * w), int(sy * h)
+            r = 22
+            self.canvas.create_oval(x - r, y - r, x + r, y + r,
+                                    fill="#00c8ff", outline="#ffffff", width=3)
+            self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#ffffff")
+            self.info_label.config(
+                text="标定点 %d/%d —— 注视蓝色圆点，头尽量不动"
+                % (self._cur + 1, len(self.POINTS)))
+            self._dwell_start = time.monotonic()
+            self._buf = []
+
+        def _collect(self):
+            if len(self._buf) < self.MIN_SAMPLES:
+                return
+            xs = sorted(b[0] for b in self._buf)
+            ys = sorted(b[1] for b in self._buf)
+            rx = xs[len(xs) // 2]
+            ry = ys[len(ys) // 2]
+            sx, sy = self.POINTS[self._cur]
+            self.samples.append((rx, ry, sx, sy))
+
+        def _finish(self):
+            coeffs = GazeCalibrator.fit(self.samples)
+            self._aborted = True
+            try:
+                self.destroy()
+            except Exception:
+                pass
+            self.on_done(coeffs, len(self.samples))
+
+        def _abort(self):
+            if self._aborted:
+                return
+            self._aborted = True
+            try:
+                self.destroy()
+            except Exception:
+                pass
+            self.on_done(None, len(self.samples))
+
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
@@ -1623,6 +1790,10 @@ def build_gui(dry_run=False):
                                         style="Accent.TButton",
                                         command=self._toggle_start)
             self.btn_start.pack(fill="x", pady=(8, 4))
+
+            self.btn_calib = ttk.Button(right, text="👁  眼 动 标 定",
+                                        command=self._start_calibration)
+            self.btn_calib.pack(fill="x", pady=(0, 4))
 
             # 设备
             box = ttk.Labelframe(right, text=" 设备 ")
@@ -1847,6 +2018,44 @@ def build_gui(dry_run=False):
             self.help_label.config(text=self._help_text())
             if self.worker and self.worker.is_alive():
                 self.worker.apply_settings(dict(self.settings))
+
+        # -- 眼动标定 --------------------------------------------------------------
+        def _start_calibration(self):
+            """标定流程：确保识别运行 -> 打开全屏九点标定窗。"""
+            self._sync_settings()
+            if self.worker and self.worker.is_alive():
+                self._open_calib_window()
+            else:
+                self._start_worker()
+                self.after(1800, self._open_calib_window)
+
+        def _open_calib_window(self):
+            if self._closed or not (self.worker and self.worker.is_alive()):
+                return
+            self.worker.apply_settings({"calibrating": True})
+            try:
+                self._calib_win = CalibrationWindow(self, on_done=self._on_calib_done)
+            except Exception as e:
+                self.worker.apply_settings({"calibrating": False})
+                messagebox.showerror(APP_NAME, "标定窗口创建失败：%s" % e)
+
+        def _on_calib_done(self, coeffs, n_samples):
+            if self.worker and self.worker.is_alive():
+                self.worker.apply_settings({"calibrating": False})
+            if self._closed:
+                return
+            if coeffs is not None:
+                self.settings["gaze_calib"] = coeffs
+                save_settings(self.settings)
+                messagebox.showinfo(
+                    APP_NAME,
+                    "标定完成！已用 %d 个采样点拟合你的个人注视映射。\n"
+                    "眼动模式下光标会按你的注视特征移动，指向更精准。" % n_samples)
+            else:
+                messagebox.showwarning(
+                    APP_NAME,
+                    "标定未完成（样本不足或已取消）。\n"
+                    "标定时请保持正对摄像头、注视圆点时头部尽量不动。")
 
         # -- 右下角监视窗 ----------------------------------------------------------
         def _live_monitor(self):

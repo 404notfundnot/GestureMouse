@@ -430,6 +430,21 @@ d = delta(mouse6, before)
 print("阶段T(眼动+左手1指=左键单击) 增量:", d)
 assert d["lclick"] == 1
 
+# 阶段 U：标定映射路径（带 gaze_calib 时走个人化映射，不崩溃且移动正常）
+calib_pts = []
+for sx, sy in [(0.5, 0.5), (0.12, 0.12), (0.88, 0.12), (0.88, 0.88),
+               (0.12, 0.88), (0.5, 0.12), (0.88, 0.5), (0.5, 0.88), (0.12, 0.5)]:
+    calib_pts.append((0.3 + 0.35 * sx - 0.08 * sy + 0.05 * sx * sy,
+                      0.5 + 0.3 * sy - 0.1 * sx + 0.02 * sx * sy, sx, sy))
+calib_coeffs = gm.GazeCalibrator.fit(calib_pts)
+assert calib_coeffs is not None
+mouse7 = gm.DryRunMouse()
+interp7 = gm.GestureInterpreter(mouse7, dict(gm.DEFAULT_SETTINGS, hands_mode="gaze",
+                                             gaze_calib=calib_coeffs, smoothing=0.5))
+step_res(interp7, make_gaze_result((0.3 + 0.35 * 0.88, 0.5 + 0.3 * 0.12)), n=10)
+print("阶段U(标定映射) events:", dict(mouse7.events))
+assert mouse7.events["move"] > 5
+
 engine.close()
 skin.close()
 print("ALL OK")
